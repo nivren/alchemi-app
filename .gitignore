@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+artifacts/
+outputs/
+*.cif
+*.model
+*.pt

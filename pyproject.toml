@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alchemi-app"
+version = "0.1.0"
+description = "CIF batch relaxation application using native nvalchemi FIRE/FIRE2"
+requires-python = ">=3.11"
+dependencies = [
+  "ase>=3.27.0",
+  "nvalchemi-toolkit[mace,ase]==0.2.0",
+  "nvalchemi-toolkit-ops[torch-reference]==0.4.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+alchemi-mpa0-relax = "alchemi_app.relax_mace_mpa0:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv.sources]
+nvalchemi-toolkit = { path = "../alchemi-hygon/packages/framework", editable = true }
+nvalchemi-toolkit-ops = { path = "../alchemi-hygon/packages/ops", editable = true }
