@@ -1,0 +1,32 @@
+# Copy this file, then edit paths and run settings for one relaxation job.
+# All relative paths are resolved from the alchemi-app project root.
+
+[run]
+mode = "relax"
+output_dir = "artifacts/mace-relax-run"
+device = "cuda:0"
+
+[environment]
+HIP_VISIBLE_DEVICES = "4"
+OMP_NUM_THREADS = "1"
+
+[inputs]
+input_dir = "/path/to/periodic-cif-directory"
+checkpoint = "/path/to/mace-mpa-0-medium.model"
+
+[batch]
+mode = "atoms" # choose "atoms" or "bsize"; only set that mode's capacity
+max_atoms = 256
+# For mode = "bsize", use batch_size = 4 and remove max_atoms.
+
+[relaxation]
+inference_backend = "e3nn" # choose "fasteq" on the local HCU stack
+optimizer = "fire"
+dtype = "float64"
+limit = 10
+max_steps = 500
+max_wall_seconds = 180
+dt = 0.02
+fmax_eV_A = 0.01
+stress_gpa = 0.1
+skin_A = 0.0

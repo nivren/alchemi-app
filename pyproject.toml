@@ -15,9 +15,15 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+hcu-fasteq = [
+  "cuequivariance==0.8.0",
+  "cuequivariance-torch==0.8.0",
+  "fasteq==0.3.0",
+]
 
 [project.scripts]
 alchemi-mpa0-relax = "alchemi_app.relax_mace_mpa0:main"
+alchemi-mpa0-run = "alchemi_app.run_relaxation:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -29,3 +35,9 @@ testpaths = ["tests"]
 [tool.uv.sources]
 nvalchemi-toolkit = { path = "../alchemi-hygon/packages/framework", editable = true }
 nvalchemi-toolkit-ops = { path = "../alchemi-hygon/packages/ops", editable = true }
+cuequivariance-torch = [
+  { path = "../rocEquivarience", editable = true, extra = "hcu-fasteq" },
+]
+fasteq = [
+  { path = "../newFastEq", editable = true, extra = "hcu-fasteq" },
+]

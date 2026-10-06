@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -31,11 +33,88 @@ from nvalchemi.neighbors import compute_neighbors
 
 MODEL_SHA256 = "75428afe3a1d7d8062e19bcaabd5c433623cabf308242ec9fb493e38604fb638"
 GPA_TO_EV_A3 = 1 / 160.21766208
+_LOADED_FASTEQ_LIBRARIES = set()
 
 
 def sha256(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _configure_fasteq_runtime():
+    """Select the local HIP code path and load its registered Torch operators."""
+    names = (
+        "FASTEQ_BACKEND",
+        "FASTEQ_CODEGEN_BACKEND",
+        "FASTEQ_INFERENCE",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(
+        FASTEQ_BACKEND="hip",
+        FASTEQ_CODEGEN_BACKEND="native",
+        FASTEQ_INFERENCE="1",
+    )
+    try:
+        spec = importlib.util.find_spec("fasteq.hip._hip")
+        if spec is None or spec.origin is None:
+            raise RuntimeError(
+                "FastEq HIP operators are missing; install the local newFastEq package"
+            )
+        import fasteq
+
+        if fasteq._BACKEND != "hip":
+            raise RuntimeError(
+                f"FastEq selected {fasteq._BACKEND!r}; the HCU path requires 'hip'"
+            )
+        library = str(Path(spec.origin).resolve())
+        if library not in _LOADED_FASTEQ_LIBRARIES:
+            torch.ops.load_library(library)
+            _LOADED_FASTEQ_LIBRARIES.add(library)
+        # Fail here with a clear loader error instead of deep in MACE inference.
+        torch.ops.stc_fwd.forward
+        torch.ops.stc_bwd.backward
+    except Exception:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        raise
+    return previous
+
+
+def _restore_fasteq_runtime(previous):
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def _load_fasteq_mace(checkpoint, device, dtype):
+    """Convert MACE through the installed local cuEquivariance Torch frontend."""
+    if device.type != "cuda" or not torch.version.hip:
+        raise RuntimeError("--fasteq requires a Hygon HIP build and a cuda device")
+
+    from mace.cli.convert_e3nn_cueq import run as convert_e3nn_to_cueq
+
+    model = torch.load(checkpoint, weights_only=False, map_location=device)
+    model.to(dtype=dtype)
+    # On Hygon, PyTorch exposes the HIP device through its cuda namespace.
+    with torch.cuda.device(device):
+        model = convert_e3nn_to_cueq(
+            model, return_model=True, device="cuda"
+        )
+    fast_layers = [
+        layer for layer in model.modules() if hasattr(layer, "fast_inference")
+    ]
+    if not fast_layers or not all(layer.fast_inference for layer in fast_layers):
+        raise RuntimeError(
+            "the converted MACE model did not activate the local FastEq inference path"
+        )
+    wrapper = MACEWrapper(model.to(device))
+    wrapper.eval()
+    return wrapper
 
 
 class CIFDataset:
@@ -72,8 +151,10 @@ class CIFDataset:
 
 
 def validate_atoms(atoms, supported, max_atoms):
-    if not len(atoms) or len(atoms) > max_atoms:
-        raise ValueError("empty structure or atom count exceeds --max-atoms")
+    if not len(atoms):
+        raise ValueError("empty structure")
+    if max_atoms is not None and len(atoms) > max_atoms:
+        raise ValueError("atom count exceeds --max-atoms")
     if not atoms.pbc.all():
         raise ValueError("three-dimensional periodicity required")
     if (
@@ -159,14 +240,15 @@ def relax(
     optimizer="fire2",
     device="cpu",
     dtype=torch.float64,
-    max_batch_size=2,
-    max_atoms=256,
+    max_batch_size=None,
+    max_atoms=None,
     max_steps=500,
     max_wall_seconds=120,
     dt=0.02,
     fmax=0.01,
     stress_gpa=0.1,
     skin=0.0,
+    fasteq=False,
 ):
     """Return one auditable result per source, using bounded native inflight work."""
     if not paths:
@@ -176,8 +258,11 @@ def relax(
         torch.float64,
     ):
         raise ValueError("unsupported optimizer or dtype")
+    capacities = [value for value in (max_batch_size, max_atoms) if value is not None]
+    if len(capacities) != 1:
+        raise ValueError("set exactly one of max_atoms or max_batch_size")
     if (
-        min(max_batch_size, max_atoms, max_steps) <= 0
+        min([*capacities, max_steps]) <= 0
         or any(
             not math.isfinite(x) or x <= 0
             for x in (max_wall_seconds, dt, fmax, stress_gpa)
@@ -200,14 +285,19 @@ def relax(
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)  # MPA-0's integer-Z power depends on this.
     started = time.monotonic()
+    fasteq_environment = None
     try:
-        model = MACEWrapper.from_checkpoint(
-            checkpoint,
-            device=device,
-            dtype=dtype,
-            enable_cueq=False,
-            compile_model=False,
-        )
+        if fasteq:
+            fasteq_environment = _configure_fasteq_runtime()
+            model = _load_fasteq_mace(checkpoint, device, dtype)
+        else:
+            model = MACEWrapper.from_checkpoint(
+                checkpoint,
+                device=device,
+                dtype=dtype,
+                enable_cueq=False,
+                compile_model=False,
+            )
         model.set_config("active_outputs", {"energy", "forces", "stress"})
         model.eval()
         supported = set(map(int, model.model.atomic_numbers.detach().cpu().tolist()))
@@ -374,8 +464,10 @@ def relax(
         metadata = {
             "model_sha256": model_hash,
             "optimizer": optimizer,
+            "batch_mode": "atoms" if max_atoms is not None else "bsize",
             "backend": "torch_reference",
             "neighbor_backend": "torch_reference",
+            "inference_backend": "rocEquivarience+newFastEq" if fasteq else "e3nn",
             "device": str(device),
             "device_name": torch.cuda.get_device_name(device)
             if device.type == "cuda"
@@ -400,6 +492,8 @@ def relax(
         return records
     finally:
         torch.set_default_dtype(previous_dtype)
+        if fasteq_environment is not None:
+            _restore_fasteq_runtime(fasteq_environment)
 
 
 def main():
@@ -409,10 +503,16 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--optimizer", choices=("fire", "fire2"), default="fire2")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--fasteq",
+        action="store_true",
+        help="use the local rocEquivarience/newFastEq HIP inference path",
+    )
     parser.add_argument("--dtype", choices=("float64", "float32"), default="float64")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-batch-size", type=int, default=2)
-    parser.add_argument("--max-atoms", type=int, default=256)
+    parser.add_argument("--batch-mode", choices=("atoms", "bsize"), default="atoms")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--max-atoms", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--max-wall-seconds", type=float, default=120)
     parser.add_argument("--dt", type=float, default=0.02)
@@ -420,6 +520,21 @@ def main():
     parser.add_argument("--stress-gpa", type=float, default=0.1)
     parser.add_argument("--skin", type=float, default=0.0)
     args = vars(parser.parse_args())
+    batch_mode = args.pop("batch_mode")
+    batch_size = args.pop("batch_size")
+    max_atoms = args.pop("max_atoms")
+    if batch_mode == "atoms":
+        if batch_size is not None:
+            parser.error("--batch-size is only valid with --batch-mode bsize")
+        args["max_batch_size"] = None
+        args["max_atoms"] = 256 if max_atoms is None else max_atoms
+    else:
+        if max_atoms is not None:
+            parser.error("--max-atoms is only valid with --batch-mode atoms")
+        if batch_size is None:
+            parser.error("--batch-mode bsize requires --batch-size")
+        args["max_batch_size"] = batch_size
+        args["max_atoms"] = None
     directory = args.pop("input_dir")
     if not directory.is_dir():
         parser.error("--input-dir must be an existing directory")

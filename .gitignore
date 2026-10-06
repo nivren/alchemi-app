@@ -7,3 +7,6 @@ outputs/
 *.cif
 *.model
 *.pt
+
+# FastEq emits HIP JIT source into the current working directory.
+/generated_uniform1d_*_lars.cu
